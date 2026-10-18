@@ -926,7 +926,7 @@ if not df_signal_full.empty:
         return ""
 
     # Limit height so it doesn't dominate; force horizontal overflow via container
-    styled_excel = df_signal_full
+    styled_excel = df_signal_full.style.map(highlight_signal_cells)
     st.dataframe(
         styled_excel,
         use_container_width=True,
