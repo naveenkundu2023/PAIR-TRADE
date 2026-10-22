@@ -5,7 +5,7 @@ Automated pair-trading signal dashboard using independent analytics only.
 No Excel dependency.
 
 How to run:
-    1. pip install streamlit pandas numpy yfinance plotly openpyxl scipy
+    1. pip install streamlit pandas numpy yfinance plotly openpyxl scipy statsmodels
     2. streamlit run pair_trade_dashboard.py
 
 Features:
@@ -22,7 +22,9 @@ Features:
     - Signal timestamp (approximate entry time of current signal)
     - Signal board: 1-based index, sorted ENTER (freshest first) → EXIT/HOLD → WATCH
     - Charts: clear x-axis date range + mobile-friendly config
-    - Independent analytics ranked by confidence (gradient green)
+    - Independent analytics ranked by composite quality score (gradient green)
+    - Quality filters (Stage A/B): half-life 5–40d, ADF p<0.05, Hurst<0.5
+    - Composite score (Stage C): conf × (1/half-life) × corr × (1−ADF_p)
 """
 
 import streamlit as st
@@ -58,6 +60,12 @@ try:
     HAS_SCIPY = True
 except ImportError:
     HAS_SCIPY = False
+
+try:
+    from statsmodels.tsa.stattools import adfuller
+    HAS_STATSMODELS = True
+except ImportError:
+    HAS_STATSMODELS = False
 
 # ─────────────────────────────────────────────────────────────
 # PAGE CONFIG + DARK THEME
@@ -419,6 +427,59 @@ def fetch_pair_history(ticker1: str, ticker2: str, period: str = "1y") -> pd.Dat
         return pd.DataFrame()
 
 
+
+def hurst_exponent(series, max_lag: int = 20) -> float:
+    """Rescaled-range (R/S) Hurst exponent. H < 0.5 → mean-reverting."""
+    try:
+        ts = np.asarray(series.dropna(), dtype=float)
+        if len(ts) < max_lag * 2:
+            return np.nan
+        lags = range(2, max_lag + 1)
+        rs_vals = []
+        for lag in lags:
+            # chunk the series
+            n_chunks = len(ts) // lag
+            if n_chunks < 1:
+                continue
+            rs_list = []
+            for i in range(n_chunks):
+                chunk = ts[i * lag:(i + 1) * lag]
+                if len(chunk) < 2:
+                    continue
+                mean = chunk.mean()
+                dev = chunk - mean
+                cumdev = np.cumsum(dev)
+                r = cumdev.max() - cumdev.min()
+                s = chunk.std(ddof=1)
+                if s > 1e-12:
+                    rs_list.append(r / s)
+            if rs_list:
+                rs_vals.append((lag, np.mean(rs_list)))
+        if len(rs_vals) < 3:
+            return np.nan
+        log_lag = np.log([x[0] for x in rs_vals])
+        log_rs = np.log([x[1] for x in rs_vals])
+        # slope of log(R/S) vs log(lag)
+        slope = np.polyfit(log_lag, log_rs, 1)[0]
+        return float(slope)
+    except Exception:
+        return np.nan
+
+
+def adf_pvalue(series) -> float:
+    """Augmented Dickey-Fuller p-value on the series (residual / ratio)."""
+    if not HAS_STATSMODELS:
+        return np.nan
+    try:
+        ts = np.asarray(series.dropna(), dtype=float)
+        if len(ts) < 30:
+            return np.nan
+        result = adfuller(ts, maxlag=1, regression="c", autolag=None)
+        return float(result[1])  # p-value
+    except Exception:
+        return np.nan
+
+
 def compute_pair_metrics(df: pd.DataFrame, lookback: int = 60) -> dict:
     if df.empty or len(df) < 30:
         return {}
@@ -475,6 +536,12 @@ def compute_pair_metrics(df: pd.DataFrame, lookback: int = 60) -> dict:
                 half_life = -np.log(2) / slope
         except Exception:
             pass
+
+    # Stage A/B quality metrics: Hurst exponent + ADF on ratio residual
+    # residual = ratio - rolling mean (same window as Z)
+    residual = (ratio - ratio_mean).dropna()
+    hurst = hurst_exponent(residual.tail(min(120, len(residual))), max_lag=20)
+    adf_p = adf_pvalue(residual.tail(min(120, len(residual))))
 
     # Last 5 days divergence (ratio vs its 20-SMA)
     # Use a lower threshold and also compute day-over-day change so dots
@@ -533,6 +600,8 @@ def compute_pair_metrics(df: pd.DataFrame, lookback: int = 60) -> dict:
         "ratio_avg_90": ratio_avg_90,
         "ratio_mean": ratio_mean_60,
         "half_life": half_life,
+        "hurst": hurst,
+        "adf_p": adf_p,
         "ratio_series": ratio,
         "zscore_series": zscore,
         "last5_div": last5_div,
@@ -544,17 +613,60 @@ def compute_pair_metrics(df: pd.DataFrame, lookback: int = 60) -> dict:
     }
 
 
-def generate_signal(metrics: dict, z_entry: float = 1.5, z_exit: float = 0.5) -> dict:
+def composite_quality_score(metrics: dict, confidence: float) -> float:
+    """
+    Stage C: composite score for ranking ENTER signals.
+    score = conf × (1 / half_life) × |corr| × (1 − ADF_p)
+    Higher is better. Missing pieces fall back gracefully.
+    """
+    if not metrics:
+        return 0.0
+    conf = max(float(confidence), 1.0)
+    hl = metrics.get("half_life", np.nan)
+    # Prefer faster reversion: 1/hl, clamp hl to [5, 40] for scoring stability
+    if np.isnan(hl) or hl <= 0:
+        inv_hl = 1.0 / 20.0  # neutral mid-range
+    else:
+        hl_c = min(max(float(hl), 5.0), 40.0)
+        inv_hl = 1.0 / hl_c
+    corr = metrics.get("corr_30") or metrics.get("corr_60") or 0.0
+    if np.isnan(corr):
+        corr = 0.0
+    abs_corr = abs(float(corr))
+    adf_p = metrics.get("adf_p", np.nan)
+    if np.isnan(adf_p):
+        adf_term = 0.5  # neutral when test unavailable
+    else:
+        adf_term = max(0.0, 1.0 - float(adf_p))
+    return conf * inv_hl * abs_corr * adf_term
+
+
+def generate_signal(metrics: dict, z_entry: float = 1.5, z_exit: float = 0.5,
+                    use_quality_filters: bool = True) -> dict:
+    """
+    Core signal + Stage A/B quality filters.
+    Stage A: half-life in [5, 40] days AND ADF p-value < 0.05
+    Stage B: Hurst exponent < 0.5 (mean-reverting)
+    Failing filters demotes ENTER → WATCH (Quality) with an explicit reason.
+    """
     if not metrics:
         return {"action": "NO DATA", "leg1": "—", "leg2": "—", "confidence": 0,
-                "reason": "Insufficient data", "deep_reason": ""}
+                "reason": "Insufficient data", "deep_reason": "",
+                "composite": 0.0, "quality_pass": False, "quality_notes": []}
 
     z = metrics["zscore"]
     corr = metrics.get("corr_30") or metrics.get("corr_60") or 0
     abs_z = abs(z)
     corr_ok = abs(corr) >= 0.5 if not np.isnan(corr) else False
 
+    hl = metrics.get("half_life", np.nan)
+    hurst = metrics.get("hurst", np.nan)
+    adf_p = metrics.get("adf_p", np.nan)
+
     deep = ""
+    quality_notes = []
+    quality_pass = True
+
     if abs_z >= z_entry and corr_ok:
         if z > 0:
             action, leg1, leg2 = "ENTER PAIR", "SELL", "BUY"
@@ -577,27 +689,85 @@ def generate_signal(metrics: dict, z_entry: float = 1.5, z_exit: float = 0.5) ->
                 f"Buying the cheaper leg and shorting the richer leg is the classic setup."
             )
         confidence = min(95, int(40 + abs_z * 15 + (abs(corr) * 20)))
+
+        # ── Stage A + B quality filters (only when enabled) ──
+        if use_quality_filters:
+            # Stage A: half-life window
+            if not np.isnan(hl):
+                if hl < 5:
+                    quality_pass = False
+                    quality_notes.append(f"Half-life {hl:.1f}d < 5 (too fast — costs may dominate)")
+                elif hl > 40:
+                    quality_pass = False
+                    quality_notes.append(f"Half-life {hl:.1f}d > 40 (too slow — capital tied up)")
+            else:
+                quality_notes.append("Half-life unavailable")
+
+            # Stage A: ADF stationarity on residual
+            if not np.isnan(adf_p):
+                if adf_p >= 0.05:
+                    quality_pass = False
+                    quality_notes.append(f"ADF p={adf_p:.3f} ≥ 0.05 (residual not stationary)")
+            else:
+                if not HAS_STATSMODELS:
+                    quality_notes.append("ADF skipped (install statsmodels)")
+                else:
+                    quality_notes.append("ADF unavailable")
+
+            # Stage B: Hurst < 0.5
+            if not np.isnan(hurst):
+                if hurst >= 0.5:
+                    quality_pass = False
+                    quality_notes.append(f"Hurst={hurst:.2f} ≥ 0.5 (not mean-reverting)")
+            else:
+                quality_notes.append("Hurst unavailable")
+
+            if not quality_pass:
+                action = "WATCH (Quality)"
+                reason += " | " + "; ".join(quality_notes)
+                confidence = max(10, confidence - 25)
+                deep += (
+                    " Quality filters failed: " + "; ".join(quality_notes) +
+                    ". Signal demoted to WATCH until half-life / ADF / Hurst improve."
+                )
+            else:
+                quality_notes.append("All quality filters passed (HL 5–40, ADF p<0.05, Hurst<0.5)")
+                deep += (
+                    f" Quality OK: half-life={hl:.1f}d, ADF p={adf_p:.3f}, Hurst={hurst:.2f}."
+                    if not (np.isnan(hl) or np.isnan(adf_p) or np.isnan(hurst))
+                    else " Quality filters passed where data available."
+                )
+
     elif abs_z <= z_exit:
         action, leg1, leg2 = "EXIT / HOLD", "CLOSE", "CLOSE"
         reason = f"Z-score near mean ({z:.2f}). No edge / take-profit zone"
         deep = "Ratio is close to its average; edge has largely been realized or never appeared."
         confidence = 30
+        quality_pass = False
     else:
         action, leg1, leg2 = "WATCH", "—", "—"
         reason = f"Z-score {z:.2f} inside neutral band. Waiting for stretch"
         deep = "Wait for |Z| to exceed the entry threshold before committing capital."
         confidence = 20
+        quality_pass = False
 
     if not corr_ok and action == "ENTER PAIR":
         action = "WATCH (Low Corr)"
         reason += f" | Correlation only {corr:.2f} – pair quality weak"
         confidence = max(10, confidence - 30)
         deep += " Low correlation reduces confidence in mean-reversion of the ratio."
+        quality_pass = False
+
+    # Stage C composite (computed for all; used mainly to rank ENTER)
+    composite = composite_quality_score(metrics, confidence)
 
     return {
         "action": action, "leg1": leg1, "leg2": leg2,
         "confidence": confidence, "reason": reason, "deep_reason": deep,
         "z": z, "corr": corr,
+        "composite": round(composite, 4),
+        "quality_pass": quality_pass,
+        "quality_notes": quality_notes,
     }
 
 
@@ -807,11 +977,18 @@ with st.sidebar:
 
     auto_refresh = st.checkbox("Auto-refresh every 60s", value=False)
     show_charts = st.checkbox("Show detailed charts", value=True)
+    use_quality_filters = st.checkbox(
+        "Quality filters (Stage A/B)",
+        value=True,
+        help="Half-life 5–40d · ADF p<0.05 · Hurst<0.5. Failed ENTER → WATCH (Quality).",
+    )
 
     st.markdown("---")
     st.caption("Data: Yahoo Finance (independent engine)")
     st.caption(f"Lot sizes: NSE F&O — active series {fo_month_label()}")
     st.caption(f"Clock: {now_ist().strftime('%Y-%m-%d %H:%M:%S')} IST")
+    if not HAS_STATSMODELS:
+        st.caption("⚠️ statsmodels not installed → ADF filter skipped. `pip install statsmodels`")
 
     if st.button("🔄 Refresh Now"):
         st.cache_data.clear()
@@ -851,7 +1028,8 @@ for i, pair in enumerate(pairs_to_scan):
     progress.progress((i + 1) / len(pairs_to_scan), text=f"Scanning {pair['name']}…")
     hist = fetch_pair_history(pair["s1"], pair["s2"], period="1y")
     metrics = compute_pair_metrics(hist, lookback=lookback)
-    signal = generate_signal(metrics, z_entry=z_entry, z_exit=z_exit)
+    signal = generate_signal(metrics, z_entry=z_entry, z_exit=z_exit,
+                             use_quality_filters=use_quality_filters)
     prices = recommend_prices(metrics, signal)
     # Point 1: use month-aware lot sizes for cash-neutrality
     active_lot1, active_lot2 = get_active_lot_sizes(pair)
@@ -899,6 +1077,9 @@ for r in results:
         sig_since_ts = now_ist().replace(tzinfo=None)
         sig_since = now_ist().strftime("%d-%b %H:%M")
 
+    hl_val = m.get("half_life", np.nan)
+    hurst_val = m.get("hurst", np.nan)
+    adf_val = m.get("adf_p", np.nan)
     rows.append({
         "Pair": p["name"],
         "Sector": p["sector"],
@@ -909,18 +1090,22 @@ for r in results:
         "Ratio": round(m["ratio"], 4),
         "Z-Score": round(m["zscore"], 2),
         "Corr30": round(m["corr_30"], 2) if not np.isnan(m["corr_30"]) else "—",
+        "HalfLife": round(hl_val, 1) if not np.isnan(hl_val) else "—",
+        "Hurst": round(hurst_val, 2) if not np.isnan(hurst_val) else "—",
+        "ADF_p": round(adf_val, 3) if not np.isnan(adf_val) else "—",
         "Action": s["action"],
         "Leg1": s["leg1"],
         "Leg2": s["leg2"],
         "Conf%": s["confidence"],
+        "Score": s.get("composite", 0),
         "Signal Since": sig_since if sig_since else "—",
-        "HalfLife": round(m["half_life"], 1) if not np.isnan(m.get("half_life", np.nan)) else "—",
         "_sig_since_ts": sig_since_ts,  # for sorting
         "_action_rank": (
             0 if "ENTER" in s["action"] else
             1 if ("EXIT" in s["action"] or "HOLD" in s["action"]) else
             2
         ),
+        "_composite": s.get("composite", 0),
     })
 
 if not rows:
@@ -929,17 +1114,11 @@ if not rows:
 
 df_signals = pd.DataFrame(rows)
 
-# Sort: ENTER first (freshest signal_since first), then EXIT/HOLD, then WATCH
-def _sort_key(row):
-    rank = row["_action_rank"]
-    ts = row["_sig_since_ts"]
-    # freshest first → larger timestamp first; missing ts goes last within group
-    ts_val = ts.timestamp() if ts is not None and hasattr(ts, "timestamp") else 0
-    return (rank, -ts_val)
-
+# Sort: ENTER first (highest composite score, then freshest signal_since),
+# then EXIT/HOLD, then WATCH
 df_signals = df_signals.sort_values(
-    by=["_action_rank", "_sig_since_ts"],
-    ascending=[True, False],
+    by=["_action_rank", "_composite", "_sig_since_ts"],
+    ascending=[True, False, False],
     na_position="last",
 ).reset_index(drop=True)
 
@@ -978,6 +1157,7 @@ styled = (df_display.style
           .format({
               "Price1": "{:.2f}", "Price2": "{:.2f}",
               "Ratio": "{:.4f}", "Z-Score": "{:.2f}",
+              "Score": "{:.3f}",
           }))
 
 # Height large enough for ~40 pairs
@@ -1013,13 +1193,17 @@ active_lot1 = selected_result["active_lot1"]
 active_lot2 = selected_result["active_lot2"]
 
 # KPI row
-k1, k2, k3, k4, k5 = st.columns(5)
+k1, k2, k3, k4, k5, k6, k7 = st.columns(7)
 k1.metric("Current Ratio", f"{m['ratio']:.4f}")
 k2.metric("Z-Score", f"{m['zscore']:.2f}",
           delta="Stretched" if abs(m["zscore"]) > z_entry else "Normal")
 k3.metric("30D Corr", f"{m['corr_30']:.2f}" if not np.isnan(m["corr_30"]) else "—")
-k4.metric("60D Corr", f"{m['corr_60']:.2f}" if not np.isnan(m["corr_60"]) else "—")
-k5.metric("Half-Life (d)", f"{m['half_life']:.1f}" if not np.isnan(m.get("half_life", np.nan)) else "—")
+k4.metric("Half-Life (d)", f"{m['half_life']:.1f}" if not np.isnan(m.get("half_life", np.nan)) else "—")
+k5.metric("Hurst", f"{m['hurst']:.2f}" if not np.isnan(m.get("hurst", np.nan)) else "—",
+          delta="MR" if (not np.isnan(m.get("hurst", np.nan)) and m["hurst"] < 0.5) else "Trend?")
+k6.metric("ADF p", f"{m['adf_p']:.3f}" if not np.isnan(m.get("adf_p", np.nan)) else "—",
+          delta="OK" if (not np.isnan(m.get("adf_p", np.nan)) and m["adf_p"] < 0.05) else "Weak")
+k7.metric("Score", f"{s.get('composite', 0):.3f}")
 
 # Signal box
 if "ENTER" in s["action"]:
@@ -1343,6 +1527,10 @@ if show_charts and HAS_PLOTLY and not selected_result["hist"].empty:
 # ─────────────────────────────────────────────────────────────
 st.markdown("---")
 st.subheader("🧠 Independent Analytics — High-Conviction Entries")
+st.caption(
+    "Ranked by **composite score** (Stage C): conf × (1/half-life) × |corr| × (1−ADF_p). "
+    "Only pairs that pass quality filters (Stage A/B) appear as ENTER."
+)
 
 enter_notes = []
 for r in results:
@@ -1356,28 +1544,32 @@ for r in results:
             "name": p["name"],
             "action": s["action"],
             "conf": s["confidence"],
+            "composite": s.get("composite", 0),
             "z": m["zscore"],
             "corr": m["corr_30"],
+            "hl": m.get("half_life", np.nan),
+            "hurst": m.get("hurst", np.nan),
+            "adf_p": m.get("adf_p", np.nan),
             "reason": s["reason"],
             "deep": s.get("deep_reason", ""),
+            "qnotes": s.get("quality_notes", []),
         })
 
-# Sort highest confidence first
-enter_notes.sort(key=lambda x: x["conf"], reverse=True)
+# Stage C: sort by composite score descending
+enter_notes.sort(key=lambda x: x["composite"], reverse=True)
 
 if enter_notes:
-    # Gradient greens from bright → muted
-    # rank 0 (highest conf) = brightest green, then progressively less
     n = len(enter_notes)
     for idx, note in enumerate(enter_notes):
-        # opacity / lightness falls with rank
-        # top: rgba(0,200,83,0.28) border #00C853
-        # bottom: rgba(0,200,83,0.08) border #4CAF50
         frac = idx / max(n - 1, 1)  # 0 .. 1
         bg_alpha = 0.28 - 0.20 * frac
         border_g = int(200 - 80 * frac)
         border_color = f"rgb(0,{border_g},83)"
         rank_label = f"#{idx + 1}"
+        hl_str = f"{note['hl']:.1f}d" if not np.isnan(note["hl"]) else "—"
+        hurst_str = f"{note['hurst']:.2f}" if not np.isnan(note["hurst"]) else "—"
+        adf_str = f"{note['adf_p']:.3f}" if not np.isnan(note["adf_p"]) else "—"
+        q_str = " · ".join(note["qnotes"]) if note["qnotes"] else ""
         st.markdown(
             f"""
             <div class="conf-card" style="
@@ -1386,20 +1578,31 @@ if enter_notes:
             ">
                 <div style="font-weight:700;color:#E8F5E9 !important;margin-bottom:4px;">
                     {rank_label} &nbsp; {note['name']} &nbsp;—&nbsp; {note['action']}
-                    &nbsp;(conf {note['conf']}%)
+                    &nbsp;(conf {note['conf']}% · score {note['composite']:.3f})
                 </div>
                 <div style="font-size:0.92rem;color:#C8E6C9 !important;">
-                    Z={note['z']:.2f}, Corr30={note['corr']:.2f}. {note['reason']}
+                    Z={note['z']:.2f} · Corr30={note['corr']:.2f} · HL={hl_str} ·
+                    Hurst={hurst_str} · ADF p={adf_str}
+                </div>
+                <div style="font-size:0.92rem;color:#C8E6C9 !important;margin-top:2px;">
+                    {note['reason']}
                 </div>
                 <div style="font-size:0.85rem;color:#A5D6A7 !important;margin-top:6px;font-style:italic;">
                     Deep rational: {note['deep']}
+                </div>
+                <div style="font-size:0.8rem;color:#81C784 !important;margin-top:4px;">
+                    {q_str}
                 </div>
             </div>
             """,
             unsafe_allow_html=True,
         )
 else:
-    st.write("No high-conviction entry signals at the moment. Pairs are inside normal Z-score bands.")
+    st.write(
+        "No high-conviction entry signals at the moment. "
+        "Pairs are inside normal Z-score bands or failed quality filters "
+        "(half-life / ADF / Hurst)."
+    )
 
 # ─────────────────────────────────────────────────────────────
 # HISTORICAL WIN / LOSS SECTION  (Point 6: sort by win rate descending)
@@ -1439,7 +1642,7 @@ else:
     st.write("Not enough history to compute win-rate statistics.")
 
 st.markdown("""
-**Methodology (Independent engine):**
+**Methodology (Independent engine — v3.1 + Stages A/B/C):**
 1. Fetch 1-year daily adjusted closes via Yahoo Finance.
 2. Ratio = Stock1 / Stock2.
 3. Z-score = (Ratio − RollingMean) / RollingStd (default 60-day).
@@ -1447,9 +1650,12 @@ st.markdown("""
 5. Direction: positive Z → sell expensive leg / buy cheap leg.
 6. Support / Resistance from 60-day high/low of each leg and of the ratio.
 7. Half-life via AR(1) / Ornstein-Uhlenbeck regression.
-8. Cash-neutrality: search integer lot multiples that minimise |Value1 − Value2|.
-9. Historical stats: count mean-reversion opportunities and win rate over available history.
-10. Lot sizes are month-aware (base Oct 2026 + LOT_REVISIONS map). After each monthly expiry the engine rolls to the next month; update LOT_REVISIONS when NSE publishes new circulars.
+8. **Stage A (quality):** half-life must be in **5–40 trading days**; residual must pass **ADF p < 0.05**.
+9. **Stage B (quality):** **Hurst exponent < 0.5** (mean-reverting spread). Failures demote ENTER → WATCH (Quality).
+10. **Stage C (ranking):** composite score = conf × (1/half-life) × |corr| × (1−ADF_p). Independent Analytics ordered by this score.
+11. Cash-neutrality: search integer lot multiples that minimise |Value1 − Value2|.
+12. Historical stats: count mean-reversion opportunities and win rate over available history (sorted by win rate).
+13. Lot sizes are month-aware (base Oct 2026 + LOT_REVISIONS map). After each monthly expiry the engine rolls to the next month; update LOT_REVISIONS when NSE publishes new circulars.
 
 > ⚠️ Educational & research use only. Past mean-reversion does not guarantee future results. Always manage risk and position size carefully.
 """)
