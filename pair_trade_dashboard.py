@@ -1,5 +1,5 @@
 """
-Pair Trading Dashboard - Streamlit App (Enhanced v3 - Fully Independent)
+Pair Trading Dashboard - Streamlit App (Enhanced v3.1 - Fully Independent)
 =======================================================================
 Automated pair-trading signal dashboard using independent analytics only.
 No Excel dependency.
@@ -10,16 +10,19 @@ How to run:
 
 Features:
     - Dark theme, high-contrast UI
-    - ~40 curated pairs with latest NSE F&O lot sizes (Oct 2026)
+    - ~40 curated pairs with latest NSE F&O lot sizes (auto month-aware Oct 2026+)
     - Live prices via yfinance (NSE)
     - Correlation, Z-score, Ratio (current / 30D / 60D min-max / avg)
     - Cash-neutrality lot recommendation
     - Profit potential at different ratio targets
-    - Last-5-day divergence dots (green/red/gray) + values
+    - Last-5-day divergence dots (green/red/gray) + values + day-over-day trend
     - Z-score interpretation tooltip
-    - Historical win-rate simulation (12 months)
+    - Historical win-rate simulation (12 months) sorted by win rate
     - Row coloring: light green (ENTER), light yellow (WATCH), light pink (EXIT/HOLD)
     - Signal timestamp (approximate entry time of current signal)
+    - Signal board: 1-based index, sorted ENTER (freshest first) → EXIT/HOLD → WATCH
+    - Charts: clear x-axis date range + mobile-friendly config
+    - Independent analytics ranked by confidence (gradient green)
 """
 
 import streamlit as st
@@ -202,12 +205,20 @@ st.markdown("""
     .stCaption, small {
         color: #78909C !important;
     }
+    /* Independent analytics confidence gradient cards */
+    .conf-card {
+        border-radius: 10px;
+        padding: 12px 16px;
+        margin: 8px 0;
+        border-left: 5px solid;
+    }
 </style>
 """, unsafe_allow_html=True)
 
 # ─────────────────────────────────────────────────────────────
-# DEFAULT PAIRS (~40) with latest NSE F&O lot sizes (Oct 2026)
-# Sources: equityx.in / stockmojo / exchange masters as of ~15 Oct 2026
+# DEFAULT PAIRS (~40) with latest NSE F&O lot sizes
+# Base reference: Oct 2026 (equityx / stockmojo / NSE masters ~15 Oct 2026)
+# Monthly revision logic applied via get_active_lot_sizes()
 # ─────────────────────────────────────────────────────────────
 DEFAULT_PAIRS = [
     # Banking
@@ -318,6 +329,78 @@ DEFAULT_PAIRS = [
 ]
 
 # ─────────────────────────────────────────────────────────────
+# MONTH-AWARE LOT SIZE HELPER (Point 1)
+# NSE revises lots periodically (typically around month-end / SEBI review).
+# We keep a base snapshot (Oct 2026) and a revision map keyed by
+# (year, month) of the *near-month contract*. After each monthly expiry
+# the next month's lot is used. Until a real revision is published the
+# base lot is returned; when you update LOT_REVISIONS the new sizes
+# automatically apply for that month onward.
+# ─────────────────────────────────────────────────────────────
+# Key = (year, month) from which the new lot applies (inclusive).
+# Value = dict of ticker (without .NS / ^) -> new lot size.
+# Example (placeholder – replace with actual NSE circular numbers when published):
+# LOT_REVISIONS = {
+#     (2026, 11): {"ICICIBANK": 700, "HDFCBANK": 650, ...},  # Nov 2026 onwards
+#     (2026, 12): {...},
+#     (2027, 1): {...},
+# }
+LOT_REVISIONS = {
+    # Oct 2026 base is already in DEFAULT_PAIRS.
+    # Add future revisions here as NSE publishes circulars.
+    # (2026, 11): {},  # leave empty or fill when Nov lots are known
+}
+
+def _current_fo_month():
+    """Return (year, month) of the active near-month F&O contract.
+    NSE equity F&O expires last Tuesday of the month. After expiry day
+    we roll to the next calendar month.
+    """
+    now = now_ist()
+    y, m, d = now.year, now.month, now.day
+    # Approximate: if past ~28th of month, near-month is already next month
+    # (exact last-Tuesday logic is overkill for lot lookup; NSE rolls lots
+    # with the new series). Use day >= 28 as a safe roll trigger.
+    if d >= 28:
+        if m == 12:
+            return (y + 1, 1)
+        return (y, m + 1)
+    return (y, m)
+
+
+def get_active_lot_sizes(pair: dict) -> tuple:
+    """
+    Return (lot1, lot2) for the current F&O month.
+    Looks up LOT_REVISIONS for the most recent revision that is
+    <= current F&O month; falls back to the pair's base lot1/lot2.
+    """
+    fo_y, fo_m = _current_fo_month()
+    t1 = pair["s1"].replace(".NS", "").replace("^", "")
+    t2 = pair["s2"].replace(".NS", "").replace("^", "")
+    lot1, lot2 = pair["lot1"], pair["lot2"]
+
+    # Apply the latest revision whose key <= (fo_y, fo_m)
+    applicable = [
+        (k, v) for k, v in LOT_REVISIONS.items()
+        if k <= (fo_y, fo_m)
+    ]
+    if applicable:
+        # most recent first
+        applicable.sort(key=lambda x: x[0], reverse=True)
+        rev = applicable[0][1]
+        if t1 in rev:
+            lot1 = rev[t1]
+        if t2 in rev:
+            lot2 = rev[t2]
+    return lot1, lot2
+
+
+def fo_month_label() -> str:
+    y, m = _current_fo_month()
+    return datetime(y, m, 1).strftime("%b %Y")
+
+
+# ─────────────────────────────────────────────────────────────
 # DATA HELPERS
 # ─────────────────────────────────────────────────────────────
 @st.cache_data(ttl=55, show_spinner=False)
@@ -394,10 +477,21 @@ def compute_pair_metrics(df: pd.DataFrame, lookback: int = 60) -> dict:
             pass
 
     # Last 5 days divergence (ratio vs its 20-SMA)
+    # Use a lower threshold and also compute day-over-day change so dots
+    # are green when |divergence| is growing, red when shrinking.
     ratio_sma20 = ratio.rolling(20).mean()
     divergence = (ratio - ratio_sma20) / ratio_sma20
     last5_div = divergence.tail(5).tolist() if len(divergence) >= 5 else []
     last5_dates = [d.strftime("%d-%b") for d in divergence.tail(5).index] if len(divergence) >= 5 else []
+
+    # Absolute divergence change day-over-day (for colouring)
+    last5_abs_div = [abs(x) if not np.isnan(x) else np.nan for x in last5_div]
+    last5_div_delta = []
+    for i in range(len(last5_abs_div)):
+        if i == 0 or np.isnan(last5_abs_div[i]) or np.isnan(last5_abs_div[i - 1]):
+            last5_div_delta.append(np.nan)
+        else:
+            last5_div_delta.append(last5_abs_div[i] - last5_abs_div[i - 1])
 
     # Z-score trend (last 5 days)
     last5_z = zscore.tail(5).tolist() if len(zscore) >= 5 else []
@@ -443,6 +537,7 @@ def compute_pair_metrics(df: pd.DataFrame, lookback: int = 60) -> dict:
         "zscore_series": zscore,
         "last5_div": last5_div,
         "last5_dates": last5_dates,
+        "last5_div_delta": last5_div_delta,
         "last5_z": last5_z,
         "signal_since": signal_since,
         "df": df,
@@ -715,7 +810,7 @@ with st.sidebar:
 
     st.markdown("---")
     st.caption("Data: Yahoo Finance (independent engine)")
-    st.caption("Lot sizes: NSE F&O (Oct 2026 reference)")
+    st.caption(f"Lot sizes: NSE F&O — active series {fo_month_label()}")
     st.caption(f"Clock: {now_ist().strftime('%Y-%m-%d %H:%M:%S')} IST")
 
     if st.button("🔄 Refresh Now"):
@@ -733,7 +828,12 @@ st.markdown(
     f'Updated {_now.strftime("%Y-%m-%d %H:%M:%S")} IST</p>',
     unsafe_allow_html=True,
 )
-st.caption("📂 Independent engine only — no Excel dependency. Lot sizes from latest NSE F&O references (Oct 2026).")
+st.caption(
+    f"📂 Independent engine only — no Excel dependency. "
+    f"Lot sizes from NSE F&O references (active series: {fo_month_label()}). "
+    f"After each monthly expiry the engine rolls to the next month; "
+    f"update LOT_REVISIONS when NSE publishes new circulars."
+)
 
 if not HAS_YF:
     st.error("yfinance is not installed. Run: `pip install yfinance`")
@@ -753,11 +853,15 @@ for i, pair in enumerate(pairs_to_scan):
     metrics = compute_pair_metrics(hist, lookback=lookback)
     signal = generate_signal(metrics, z_entry=z_entry, z_exit=z_exit)
     prices = recommend_prices(metrics, signal)
-    lots_info = recommend_cash_neutral_lots(metrics, pair["lot1"], pair["lot2"]) if metrics else {}
+    # Point 1: use month-aware lot sizes for cash-neutrality
+    active_lot1, active_lot2 = get_active_lot_sizes(pair)
+    lots_info = recommend_cash_neutral_lots(metrics, active_lot1, active_lot2) if metrics else {}
     hist_stats = historical_pair_stats(hist, z_entry=z_entry, lookback=lookback) if not hist.empty else {}
 
     results.append({
         "pair": pair,
+        "active_lot1": active_lot1,
+        "active_lot2": active_lot2,
         "metrics": metrics,
         "signal": signal,
         "prices": prices,
@@ -770,6 +874,7 @@ progress.empty()
 
 # ─────────────────────────────────────────────────────────────
 # SUMMARY TABLE – all pairs visible
+# Point 2: 1-based index, sort ENTER (freshest signal_since first) → EXIT/HOLD → WATCH
 # ─────────────────────────────────────────────────────────────
 st.subheader("🎯 Live Signal Board — All Pairs")
 
@@ -783,19 +888,22 @@ for r in results:
 
     # Signal since (approximate)
     sig_since = ""
+    sig_since_ts = None
     if m.get("signal_since") is not None and "ENTER" in s["action"]:
         try:
-            sig_since = m["signal_since"].strftime("%d-%b %H:%M")
+            sig_since_ts = m["signal_since"]
+            sig_since = sig_since_ts.strftime("%d-%b %H:%M")
         except Exception:
             sig_since = str(m["signal_since"])[:16]
     elif "ENTER" in s["action"]:
+        sig_since_ts = now_ist().replace(tzinfo=None)
         sig_since = now_ist().strftime("%d-%b %H:%M")
 
     rows.append({
         "Pair": p["name"],
         "Sector": p["sector"],
-        "Lot1": p["lot1"],
-        "Lot2": p["lot2"],
+        "Lot1": r["active_lot1"],
+        "Lot2": r["active_lot2"],
         "Price1": round(m["price1"], 2),
         "Price2": round(m["price2"], 2),
         "Ratio": round(m["ratio"], 4),
@@ -807,6 +915,12 @@ for r in results:
         "Conf%": s["confidence"],
         "Signal Since": sig_since if sig_since else "—",
         "HalfLife": round(m["half_life"], 1) if not np.isnan(m.get("half_life", np.nan)) else "—",
+        "_sig_since_ts": sig_since_ts,  # for sorting
+        "_action_rank": (
+            0 if "ENTER" in s["action"] else
+            1 if ("EXIT" in s["action"] or "HOLD" in s["action"]) else
+            2
+        ),
     })
 
 if not rows:
@@ -815,18 +929,36 @@ if not rows:
 
 df_signals = pd.DataFrame(rows)
 
+# Sort: ENTER first (freshest signal_since first), then EXIT/HOLD, then WATCH
+def _sort_key(row):
+    rank = row["_action_rank"]
+    ts = row["_sig_since_ts"]
+    # freshest first → larger timestamp first; missing ts goes last within group
+    ts_val = ts.timestamp() if ts is not None and hasattr(ts, "timestamp") else 0
+    return (rank, -ts_val)
+
+df_signals = df_signals.sort_values(
+    by=["_action_rank", "_sig_since_ts"],
+    ascending=[True, False],
+    na_position="last",
+).reset_index(drop=True)
+
+# 1-based index
+df_signals.insert(0, "#", range(1, len(df_signals) + 1))
+
+# Drop helper columns before display
+display_cols = [c for c in df_signals.columns if not c.startswith("_")]
+df_display = df_signals[display_cols].copy()
+
 def color_action_row(row):
     """Light row coloring based on Action."""
     action = str(row.get("Action", ""))
     styles = [""] * len(row)
     if "ENTER" in action:
-        # very light green
         styles = ["background-color: rgba(0, 200, 83, 0.12)"] * len(row)
     elif "WATCH" in action:
-        # very light yellow
         styles = ["background-color: rgba(255, 214, 0, 0.12)"] * len(row)
     elif "EXIT" in action or "HOLD" in action:
-        # very light pink / gray-pink
         styles = ["background-color: rgba(255, 82, 82, 0.10)"] * len(row)
     return styles
 
@@ -840,7 +972,7 @@ def color_action_cell(val):
         return "background-color: #F9A825; color: #000000; font-weight: bold"
     return ""
 
-styled = (df_signals.style
+styled = (df_display.style
           .apply(color_action_row, axis=1)
           .map(color_action_cell, subset=["Action"])
           .format({
@@ -877,6 +1009,8 @@ pr = selected_result["prices"]
 pair_info = selected_result["pair"]
 lots_info = selected_result["lots_info"]
 hist_stats = selected_result["hist_stats"]
+active_lot1 = selected_result["active_lot1"]
+active_lot2 = selected_result["active_lot2"]
 
 # KPI row
 k1, k2, k3, k4, k5 = st.columns(5)
@@ -973,13 +1107,16 @@ st.markdown(
 st.markdown("#### 📦 Lot Sizes & Cash-Neutrality Recommendation")
 c1, c2 = st.columns(2)
 with c1:
-    st.markdown(f"**Exchange lot sizes (NSE F&O reference – Oct 2026)**")
+    st.markdown(f"**Exchange lot sizes (NSE F&O — active series {fo_month_label()})**")
     st.write(f"| Leg | Ticker | Lot Size |")
     st.write(f"|-----|--------|----------|")
-    st.write(f"| 1 | {pair_info['s1']} | **{pair_info['lot1']}** |")
-    st.write(f"| 2 | {pair_info['s2']} | **{pair_info['lot2']}** |")
-    st.caption("💡 Tip: NSE revises lot sizes periodically (usually around month-end / SEBI review). "
-               "Re-check official circulars and update the DEFAULT_PAIRS list when needed.")
+    st.write(f"| 1 | {pair_info['s1']} | **{active_lot1}** |")
+    st.write(f"| 2 | {pair_info['s2']} | **{active_lot2}** |")
+    st.caption(
+        "💡 Tip: NSE revises lot sizes periodically (usually around month-end / SEBI review). "
+        "After each monthly expiry the engine rolls to the next month. "
+        "When NSE publishes a new circular, add the new sizes to LOT_REVISIONS in the code."
+    )
 
 with c2:
     if lots_info:
@@ -1014,12 +1151,12 @@ if pr:
     st.markdown("#### 🎯 Suggested Entry / Target / Stop")
     c1, c2 = st.columns(2)
     with c1:
-        st.markdown(f"**{pair_info['s1']}** (Lot {pair_info['lot1']})")
+        st.markdown(f"**{pair_info['s1']}** (Lot {active_lot1})")
         st.write(f"| Entry | Target | Stop | Support | Resistance |")
         st.write(f"|-------|--------|------|---------|------------|")
         st.write(f"| {pr['entry1']} | {pr['target1']} | {pr['stop1']} | {pr['support1']} | {pr['resist1']} |")
     with c2:
-        st.markdown(f"**{pair_info['s2']}** (Lot {pair_info['lot2']})")
+        st.markdown(f"**{pair_info['s2']}** (Lot {active_lot2})")
         st.write(f"| Entry | Target | Stop | Support | Resistance |")
         st.write(f"|-------|--------|------|---------|------------|")
         st.write(f"| {pr['entry2']} | {pr['target2']} | {pr['stop2']} | {pr['support2']} | {pr['resist2']} |")
@@ -1029,24 +1166,30 @@ if pr:
         "Educational only — not financial advice."
     )
 
-# ── Last 5 days divergence dots (improved with values) ──
+# ── Last 5 days divergence dots (Point 3: green = growing |div|, red = shrinking) ──
 st.markdown("#### 📅 Last 5 Trading Days — Divergence Trend")
 if m.get("last5_div") and m.get("last5_dates"):
     dots_html = []
-    for d, div in zip(m["last5_dates"], m["last5_div"]):
+    deltas = m.get("last5_div_delta") or [np.nan] * len(m["last5_div"])
+    for d, div, dlt in zip(m["last5_dates"], m["last5_div"], deltas):
         if np.isnan(div):
             color, label = "#78909C", "●"
             val_str = "—"
-        elif div > 0.001:   # lower threshold so green/red appear more often
-            color, label = "#00E676", "●"
-            val_str = f"+{div:.4f}"
-        elif div < -0.001:
-            color, label = "#FF5252", "●"
-            val_str = f"{div:.4f}"
         else:
-            color, label = "#ECEFF1", "●"
-            val_str = f"{div:.4f}"
-        # inline color so global CSS cannot override
+            # Colour by day-over-day change in |divergence|:
+            # green = |div| growing (stretch building)
+            # red   = |div| shrinking (mean-reversion in progress)
+            # gray/white = flat / first day
+            if not np.isnan(dlt) and dlt > 0.0005:
+                color, label = "#00E676", "●"   # growing
+            elif not np.isnan(dlt) and dlt < -0.0005:
+                color, label = "#FF5252", "●"   # shrinking
+            elif abs(div) > 0.001:
+                # fallback to sign of divergence if delta unavailable
+                color, label = ("#00E676", "●") if div > 0 else ("#FF5252", "●")
+            else:
+                color, label = "#ECEFF1", "●"
+            val_str = f"{div:+.4f}"
         dots_html.append(
             f'<div style="display:inline-block;text-align:center;margin:0 12px;">'
             f'<span style="color:{color} !important;font-size:1.5rem;">{label}</span><br>'
@@ -1057,26 +1200,36 @@ if m.get("last5_div") and m.get("last5_dates"):
 
     divs = [x for x in m["last5_div"] if not np.isnan(x)]
     if len(divs) >= 2:
-        if divs[-1] > divs[0] + 0.001:
-            st.caption("Divergence is **rising** (ratio moving away from its 20-SMA) → stretch building.")
-        elif divs[-1] < divs[0] - 0.001:
-            st.caption("Divergence is **falling** (ratio moving back toward its 20-SMA) → mean-reversion in progress.")
+        abs_start, abs_end = abs(divs[0]), abs(divs[-1])
+        if abs_end > abs_start + 0.001:
+            st.caption("Divergence is **growing** (|ratio − 20-SMA| increasing day after day) → stretch building.")
+        elif abs_end < abs_start - 0.001:
+            st.caption("Divergence is **shrinking** (|ratio − 20-SMA| decreasing) → mean-reversion in progress.")
         else:
             st.caption("Divergence is roughly **stable** over the last 5 sessions.")
-    st.caption("Green = ratio above 20-SMA (positive divergence) · Red = ratio below 20-SMA · White/Gray = near zero")
+    st.caption(
+        "🟢 Green = |divergence| growing day-over-day (stretch building) · "
+        "🔴 Red = |divergence| shrinking (reversion in progress) · "
+        "⚪ White/Gray = flat / near zero"
+    )
 else:
     st.caption("Not enough history for 5-day divergence dots.")
 
-# ── Charts (clean original layout – values shown below chart, no paper annotations) ──
+# ── Charts (Point 4: clear x-axis date range + mobile-friendly) ──
 if show_charts and HAS_PLOTLY and not selected_result["hist"].empty:
     hist = selected_result["hist"]
     ratio_s = m["ratio_series"]
     z_s = m["zscore_series"]
 
+    # Explicit date range for x-axis labelling
+    x_start = hist.index[0]
+    x_end = hist.index[-1]
+    n_days = (x_end - x_start).days
+
     fig = make_subplots(
         rows=3, cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.07,
+        vertical_spacing=0.08,
         subplot_titles=(
             f"Normalized Prices — {pair_info['s1']} vs {pair_info['s2']}",
             "Ratio (Price1 / Price2) + Reference Levels",
@@ -1092,7 +1245,7 @@ if show_charts and HAS_PLOTLY and not selected_result["hist"].empty:
     fig.add_trace(go.Scatter(x=hist.index, y=norm2, name=pair_info["s2"],
                              line=dict(color="#FF5252", width=1.5)), row=1, col=1)
 
-    # Ratio + levels (simple hlines, labels outside via caption below)
+    # Ratio + levels
     fig.add_trace(go.Scatter(x=ratio_s.index, y=ratio_s, name="Ratio",
                              line=dict(color="#69F0AE", width=1.8)), row=2, col=1)
     fig.add_hline(y=m["ratio_mean"], line_dash="dash", line_color="#FFEA00", row=2, col=1)
@@ -1116,14 +1269,44 @@ if show_charts and HAS_PLOTLY and not selected_result["hist"].empty:
         showlegend=True,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, font=dict(color="#E0E0E0")),
         font=dict(color="#E0E0E0"),
-        margin=dict(l=40, r=20, t=60, b=40),
+        margin=dict(l=50, r=20, t=70, b=50),
+        # Mobile-friendly: disable drag-zoom that disfigures on touch-scroll
+        dragmode=False,
+        hovermode="x unified",
     )
-    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
+    # Explicit x-axis date ticks on the bottom subplot (shared)
+    fig.update_xaxes(
+        title_text=f"Date  ({x_start.strftime('%d-%b-%Y')} → {x_end.strftime('%d-%b-%Y')}  ·  ~{n_days} calendar days / ~{len(hist)} trading days)",
+        tickformat="%d-%b",
+        nticks=8,
+        showgrid=True,
+        gridcolor="#37474F",
+        row=3, col=1,
+    )
+    fig.update_xaxes(showgrid=True, gridcolor="#37474F", row=1, col=1)
+    fig.update_xaxes(showgrid=True, gridcolor="#37474F", row=2, col=1)
 
-    # Compact values under each chart section (small text, mobile-safe)
+    st.plotly_chart(
+        fig,
+        use_container_width=True,
+        config={
+            "displayModeBar": False,
+            "scrollZoom": False,          # prevent pinch/scroll from zooming on mobile
+            "doubleClick": False,
+            "responsive": True,
+            "staticPlot": False,
+        },
+    )
+
+    # Compact values under each chart section
     st.markdown(
         f"""
         <div style="background:#1A1F2E;border-radius:8px;padding:8px 12px;margin-top:-6px;font-size:0.78rem;line-height:1.55;color:#B0BEC5;">
+        <div>
+          <span style="color:#90CAF9;font-weight:600;">Period</span> &nbsp;
+          {x_start.strftime('%d-%b-%Y')} → {x_end.strftime('%d-%b-%Y')}
+          &nbsp;·&nbsp; ~{n_days} calendar days / {len(hist)} trading days
+        </div>
         <div>
           <span style="color:#90CAF9;font-weight:600;">Normalized</span> &nbsp;
           <span style="color:#00E5FF;">{pair_info['s1'].replace('.NS','')}: {norm1.iloc[-1]:.1f}</span>
@@ -1156,12 +1339,12 @@ if show_charts and HAS_PLOTLY and not selected_result["hist"].empty:
     st.markdown(interpret_z_trend(m.get("last5_z", [])))
 
 # ─────────────────────────────────────────────────────────────
-# INDEPENDENT ANALYTICS NOTES
+# INDEPENDENT ANALYTICS NOTES  (Point 5: ranked by confidence, gradient green)
 # ─────────────────────────────────────────────────────────────
 st.markdown("---")
 st.subheader("🧠 Independent Analytics — High-Conviction Entries")
 
-notes = []
+enter_notes = []
 for r in results:
     if not r["metrics"]:
         continue
@@ -1169,27 +1352,65 @@ for r in results:
     m = r["metrics"]
     p = r["pair"]
     if "ENTER" in s["action"]:
-        notes.append(
-            f"**{p['name']}** — {s['action']} (conf {s['confidence']}%). "
-            f"Z={m['zscore']:.2f}, Corr30={m['corr_30']:.2f}. {s['reason']}\n\n"
-            f"&nbsp;&nbsp;&nbsp;*Deep rational:* {s.get('deep_reason', '')}"
-        )
+        enter_notes.append({
+            "name": p["name"],
+            "action": s["action"],
+            "conf": s["confidence"],
+            "z": m["zscore"],
+            "corr": m["corr_30"],
+            "reason": s["reason"],
+            "deep": s.get("deep_reason", ""),
+        })
 
-if notes:
-    for n in notes:
-        st.markdown(f"- {n}")
+# Sort highest confidence first
+enter_notes.sort(key=lambda x: x["conf"], reverse=True)
+
+if enter_notes:
+    # Gradient greens from bright → muted
+    # rank 0 (highest conf) = brightest green, then progressively less
+    n = len(enter_notes)
+    for idx, note in enumerate(enter_notes):
+        # opacity / lightness falls with rank
+        # top: rgba(0,200,83,0.28) border #00C853
+        # bottom: rgba(0,200,83,0.08) border #4CAF50
+        frac = idx / max(n - 1, 1)  # 0 .. 1
+        bg_alpha = 0.28 - 0.20 * frac
+        border_g = int(200 - 80 * frac)
+        border_color = f"rgb(0,{border_g},83)"
+        rank_label = f"#{idx + 1}"
+        st.markdown(
+            f"""
+            <div class="conf-card" style="
+                background: rgba(0, 200, 83, {bg_alpha:.2f});
+                border-left-color: {border_color};
+            ">
+                <div style="font-weight:700;color:#E8F5E9 !important;margin-bottom:4px;">
+                    {rank_label} &nbsp; {note['name']} &nbsp;—&nbsp; {note['action']}
+                    &nbsp;(conf {note['conf']}%)
+                </div>
+                <div style="font-size:0.92rem;color:#C8E6C9 !important;">
+                    Z={note['z']:.2f}, Corr30={note['corr']:.2f}. {note['reason']}
+                </div>
+                <div style="font-size:0.85rem;color:#A5D6A7 !important;margin-top:6px;font-style:italic;">
+                    Deep rational: {note['deep']}
+                </div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
 else:
     st.write("No high-conviction entry signals at the moment. Pairs are inside normal Z-score bands.")
 
 # ─────────────────────────────────────────────────────────────
-# HISTORICAL WIN / LOSS SECTION
+# HISTORICAL WIN / LOSS SECTION  (Point 6: sort by win rate descending)
 # ─────────────────────────────────────────────────────────────
 st.markdown("---")
 st.subheader("📊 Historical Pair Performance (Simulated — Last ~12 Months)")
 
 st.caption(
     "Simple back-test: enter when |Z| ≥ entry threshold, exit when |Z| ≤ 0.5 or after 30 trading days. "
-    "P&L measured on the ratio. Past results do not guarantee future performance."
+    "P&L measured on the ratio. Past results do not guarantee future performance. "
+    "Sorted by Win Rate % (highest first)."
 )
 
 hist_rows = []
@@ -1206,7 +1427,9 @@ for r in results:
     })
 
 if hist_rows:
-    st.dataframe(pd.DataFrame(hist_rows), use_container_width=True, hide_index=True)
+    df_hist = pd.DataFrame(hist_rows)
+    df_hist = df_hist.sort_values("Win Rate %", ascending=False).reset_index(drop=True)
+    st.dataframe(df_hist, use_container_width=True, hide_index=True)
 
     sel_hs = selected_result.get("hist_stats") or {}
     if sel_hs.get("details"):
@@ -1226,7 +1449,7 @@ st.markdown("""
 7. Half-life via AR(1) / Ornstein-Uhlenbeck regression.
 8. Cash-neutrality: search integer lot multiples that minimise |Value1 − Value2|.
 9. Historical stats: count mean-reversion opportunities and win rate over available history.
-10. Lot sizes are hardcoded from latest NSE F&O references (Oct 2026) and can be updated manually when NSE revises them.
+10. Lot sizes are month-aware (base Oct 2026 + LOT_REVISIONS map). After each monthly expiry the engine rolls to the next month; update LOT_REVISIONS when NSE publishes new circulars.
 
 > ⚠️ Educational & research use only. Past mean-reversion does not guarantee future results. Always manage risk and position size carefully.
 """)
