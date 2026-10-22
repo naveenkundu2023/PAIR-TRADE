@@ -5,7 +5,7 @@ Automated pair-trading signal dashboard using independent analytics only.
 No Excel dependency.
 
 How to run:
-    1. pip install streamlit pandas numpy yfinance plotly openpyxl scipy
+    1. pip install streamlit pandas numpy yfinance plotly openpyxl scipy statsmodels
     2. streamlit run pair_trade_dashboard.py
 
 Features:
@@ -55,6 +55,14 @@ try:
     HAS_SCIPY = True
 except ImportError:
     HAS_SCIPY = False
+
+# Optional statistical tests for the supplementary research filter.
+# These diagnostics do NOT alter the existing ENTER / WATCH / EXIT logic.
+try:
+    from statsmodels.tsa.stattools import coint, adfuller
+    HAS_STATSMODELS = True
+except ImportError:
+    HAS_STATSMODELS = False
 
 # ─────────────────────────────────────────────────────────────
 # PAGE CONFIG + DARK THEME
@@ -660,6 +668,155 @@ def historical_pair_stats(df: pd.DataFrame, z_entry: float = 1.5, lookback: int 
     }
 
 
+def enhanced_pair_diagnostics(df: pd.DataFrame, lookback: int = 60) -> dict:
+    """
+    Supplementary statistical-quality diagnostics.
+    These are advisory only and intentionally do not change the existing signal.
+    Uses available adjusted-close history; one year is a limited sample for
+    establishing long-term cointegration.
+    """
+    empty = {
+        "coint_pvalue": np.nan, "spread_adf_pvalue": np.nan,
+        "log_hedge_beta": np.nan, "spread_half_life": np.nan,
+        "beta_stability_pct": np.nan, "log_spread_zscore": np.nan,
+        "enhanced_status": "INSUFFICIENT DATA",
+        "enhanced_reason": "Insufficient history for supplementary tests",
+    }
+    if df.empty or len(df) < max(lookback + 10, 90):
+        return empty
+
+    try:
+        log1 = np.log(pd.to_numeric(df["price1"], errors="coerce"))
+        log2 = np.log(pd.to_numeric(df["price2"], errors="coerce"))
+        pair_logs = pd.concat([log1.rename("log1"), log2.rename("log2")], axis=1).dropna()
+        if len(pair_logs) < max(lookback + 10, 90):
+            return empty
+
+        # OLS log-price hedge ratio, fitted only to the history currently available.
+        beta, alpha = np.polyfit(pair_logs["log2"].values, pair_logs["log1"].values, 1)
+        spread = pair_logs["log1"] - (alpha + beta * pair_logs["log2"])
+        rolling_mean = spread.rolling(lookback).mean()
+        rolling_std = spread.rolling(lookback).std()
+        log_z = (spread - rolling_mean) / rolling_std.replace(0, np.nan)
+        current_log_z = float(log_z.iloc[-1]) if pd.notna(log_z.iloc[-1]) else np.nan
+
+        coint_p = np.nan
+        adf_p = np.nan
+        if HAS_STATSMODELS:
+            try:
+                # Engle-Granger cointegration test on log prices.
+                coint_p = float(coint(pair_logs["log1"], pair_logs["log2"], trend="c")[1])
+            except Exception:
+                pass
+            try:
+                adf_p = float(adfuller(spread.dropna(), autolag="AIC")[1])
+            except Exception:
+                pass
+
+        # Half-life of the estimated residual spread: ΔS_t = a + lambda*S_(t-1).
+        spread_lag = spread.shift(1)
+        spread_delta = spread.diff()
+        reg = pd.concat([spread_lag.rename("lag"), spread_delta.rename("delta")], axis=1).dropna()
+        spread_hl = np.nan
+        if len(reg) >= 30:
+            try:
+                slope, _intercept = np.polyfit(reg["lag"].values, reg["delta"].values, 1)
+                if slope < 0:
+                    spread_hl = float(-np.log(2) / slope)
+            except Exception:
+                pass
+
+        # Rolling hedge-ratio stability: beta estimated on rolling windows.
+        rolling_betas = []
+        window = max(60, min(lookback, 120))
+        if len(pair_logs) >= window * 2:
+            for end in range(window, len(pair_logs) + 1, 10):
+                sample = pair_logs.iloc[end-window:end]
+                try:
+                    b, _a = np.polyfit(sample["log2"].values, sample["log1"].values, 1)
+                    if np.isfinite(b):
+                        rolling_betas.append(float(b))
+                except Exception:
+                    continue
+        beta_stability = np.nan
+        if len(rolling_betas) >= 3:
+            beta_mean = float(np.mean(rolling_betas))
+            beta_stability = float(np.std(rolling_betas, ddof=1) / max(abs(beta_mean), 1e-8) * 100)
+
+        # Preliminary advisory status. Multiple-testing correction is applied later
+        # across all candidate pairs, before assigning the final status.
+        if not HAS_STATSMODELS:
+            status = "TESTS UNAVAILABLE"
+            reason = "Install statsmodels to enable cointegration and ADF tests"
+        elif np.isnan(coint_p) or np.isnan(adf_p):
+            status = "TEST ERROR"
+            reason = "Cointegration / ADF test could not be calculated"
+        elif coint_p >= 0.05 or adf_p >= 0.05:
+            status = "FAIL STATISTICAL TEST"
+            reason = "Cointegration or spread-stationarity p-value is not below 0.05"
+        elif np.isnan(spread_hl) or not (3 <= spread_hl <= 30):
+            status = "WATCH HALF-LIFE"
+            reason = "Spread half-life is unavailable or outside the initial 3–30 session research range"
+        elif not np.isnan(beta_stability) and beta_stability > 35:
+            status = "WATCH HEDGE RATIO"
+            reason = "Rolling hedge ratio varies materially; inspect relationship stability"
+        else:
+            status = "PASS PRELIMINARY"
+            reason = "Preliminary tests pass; costs, walk-forward validation and execution feasibility remain unverified"
+
+        return {
+            "coint_pvalue": coint_p,
+            "spread_adf_pvalue": adf_p,
+            "log_hedge_beta": float(beta),
+            "spread_half_life": spread_hl,
+            "beta_stability_pct": beta_stability,
+            "log_spread_zscore": current_log_z,
+            "enhanced_status": status,
+            "enhanced_reason": reason,
+        }
+    except Exception as exc:
+        result = dict(empty)
+        result["enhanced_status"] = "TEST ERROR"
+        result["enhanced_reason"] = f"Supplementary diagnostics failed: {type(exc).__name__}"
+        return result
+
+
+def apply_bh_fdr_correction(results: list, pvalue_key: str = "coint_pvalue",
+                            q_threshold: float = 0.10) -> None:
+    """Apply Benjamini-Hochberg FDR correction across available pair p-values."""
+    candidates = []
+    for item in results:
+        diag = item.get("enhanced", {})
+        pval = diag.get(pvalue_key, np.nan)
+        if pval is not None and np.isfinite(pval):
+            candidates.append((float(pval), item))
+        diag["coint_qvalue"] = np.nan
+
+    candidates.sort(key=lambda x: x[0])
+    n = len(candidates)
+    if not n:
+        return
+
+    adjusted = [1.0] * n
+    running_min = 1.0
+    for reverse_index in range(n - 1, -1, -1):
+        pval = candidates[reverse_index][0]
+        rank = reverse_index + 1
+        running_min = min(running_min, pval * n / rank)
+        adjusted[reverse_index] = min(1.0, running_min)
+
+    for (_, item), qval in zip(candidates, adjusted):
+        item["enhanced"]["coint_qvalue"] = float(qval)
+        diag = item["enhanced"]
+        if np.isfinite(diag.get("coint_pvalue", np.nan)):
+            if qval >= q_threshold:
+                diag["enhanced_status"] = "FAIL FDR FILTER"
+                diag["enhanced_reason"] = (
+                    f"Cointegration did not pass Benjamini–Hochberg FDR q<{q_threshold:.2f}; "
+                    "this is a research screen, not a final trading decision"
+                )
+
+
 def recommend_prices(metrics: dict, signal: dict) -> dict:
     if not metrics or signal["action"] not in ("ENTER PAIR",):
         return {}
@@ -764,7 +921,12 @@ for i, pair in enumerate(pairs_to_scan):
         "lots_info": lots_info,
         "hist_stats": hist_stats,
         "hist": hist,
+        "enhanced": enhanced_pair_diagnostics(hist, lookback=lookback) if not hist.empty else {},
     })
+
+# Apply multiple-testing correction across the scanned universe.
+# This is a supplementary research label only; existing trading signals remain unchanged.
+apply_bh_fdr_correction(results, pvalue_key="coint_pvalue", q_threshold=0.10)
 
 progress.empty()
 
@@ -807,6 +969,15 @@ for r in results:
         "Conf%": s["confidence"],
         "Signal Since": sig_since if sig_since else "—",
         "HalfLife": round(m["half_life"], 1) if not np.isnan(m.get("half_life", np.nan)) else "—",
+        "Coint p": round(r.get("enhanced", {}).get("coint_pvalue", np.nan), 4)
+                   if np.isfinite(r.get("enhanced", {}).get("coint_pvalue", np.nan)) else "—",
+        "Coint q": round(r.get("enhanced", {}).get("coint_qvalue", np.nan), 4)
+                   if np.isfinite(r.get("enhanced", {}).get("coint_qvalue", np.nan)) else "—",
+        "Spread ADF p": round(r.get("enhanced", {}).get("spread_adf_pvalue", np.nan), 4)
+                        if np.isfinite(r.get("enhanced", {}).get("spread_adf_pvalue", np.nan)) else "—",
+        "Spread HL": round(r.get("enhanced", {}).get("spread_half_life", np.nan), 1)
+                     if np.isfinite(r.get("enhanced", {}).get("spread_half_life", np.nan)) else "—",
+        "Research Gate": r.get("enhanced", {}).get("enhanced_status", "NO DATA"),
     })
 
 if not rows:
@@ -886,6 +1057,20 @@ k2.metric("Z-Score", f"{m['zscore']:.2f}",
 k3.metric("30D Corr", f"{m['corr_30']:.2f}" if not np.isnan(m["corr_30"]) else "—")
 k4.metric("60D Corr", f"{m['corr_60']:.2f}" if not np.isnan(m["corr_60"]) else "—")
 k5.metric("Half-Life (d)", f"{m['half_life']:.1f}" if not np.isnan(m.get("half_life", np.nan)) else "—")
+
+# Supplementary research filter: deliberately advisory, does not change core signal.
+ed = selected_result.get("enhanced", {})
+st.markdown("#### 🧪 Enhanced Statistical Pair-Quality Checks (Advisory)")
+if not HAS_STATSMODELS:
+    st.warning("Optional statistical tests are not enabled. Add `statsmodels` to requirements.txt / install it to calculate cointegration and ADF diagnostics.")
+enhanced_cols = st.columns(5)
+enhanced_cols[0].metric("Cointegration p", f"{ed.get('coint_pvalue'):.4f}" if np.isfinite(ed.get("coint_pvalue", np.nan)) else "—")
+enhanced_cols[1].metric("Cointegration q (FDR)", f"{ed.get('coint_qvalue'):.4f}" if np.isfinite(ed.get("coint_qvalue", np.nan)) else "—")
+enhanced_cols[2].metric("Spread ADF p", f"{ed.get('spread_adf_pvalue'):.4f}" if np.isfinite(ed.get("spread_adf_pvalue", np.nan)) else "—")
+enhanced_cols[3].metric("Log-spread half-life", f"{ed.get('spread_half_life'):.1f} days" if np.isfinite(ed.get("spread_half_life", np.nan)) else "—")
+enhanced_cols[4].metric("Rolling beta variation", f"{ed.get('beta_stability_pct'):.1f}%" if np.isfinite(ed.get("beta_stability_pct", np.nan)) else "—")
+st.write(f"**Research gate:** `{ed.get('enhanced_status', 'NO DATA')}` — {ed.get('enhanced_reason', 'No diagnostics available')}")
+st.caption("Important: this is a supplementary screen on the available history. It does not gate or change the existing ENTER / WATCH / EXIT action. A one-year sample is limited; a PASS is not proof of profitability. Costs, historical contract details, live liquidity and walk-forward results are not yet included in this diagnostic.")
 
 # Signal box
 if "ENTER" in s["action"]:
@@ -1215,6 +1400,29 @@ if hist_rows:
 else:
     st.write("Not enough history to compute win-rate statistics.")
 
+# New supplementary diagnostics table across all scanned pairs.
+st.markdown("#### 🧪 Supplementary Pair-Quality Filter — All Pairs")
+diagnostic_rows = []
+for r in results:
+    ed = r.get("enhanced", {})
+    if not ed:
+        continue
+    diagnostic_rows.append({
+        "Pair": r["pair"]["name"],
+        "Research Gate": ed.get("enhanced_status", "NO DATA"),
+        "Cointegration p": round(ed.get("coint_pvalue"), 4) if np.isfinite(ed.get("coint_pvalue", np.nan)) else "—",
+        "Cointegration q": round(ed.get("coint_qvalue"), 4) if np.isfinite(ed.get("coint_qvalue", np.nan)) else "—",
+        "Spread ADF p": round(ed.get("spread_adf_pvalue"), 4) if np.isfinite(ed.get("spread_adf_pvalue", np.nan)) else "—",
+        "Log Hedge Beta": round(ed.get("log_hedge_beta"), 4) if np.isfinite(ed.get("log_hedge_beta", np.nan)) else "—",
+        "Spread Half-Life": round(ed.get("spread_half_life"), 1) if np.isfinite(ed.get("spread_half_life", np.nan)) else "—",
+        "Beta Variation %": round(ed.get("beta_stability_pct"), 1) if np.isfinite(ed.get("beta_stability_pct", np.nan)) else "—",
+        "Reason": ed.get("enhanced_reason", ""),
+    })
+if diagnostic_rows:
+    st.dataframe(pd.DataFrame(diagnostic_rows), use_container_width=True, hide_index=True)
+else:
+    st.info("Supplementary diagnostics will appear when enough price history is available.")
+
 st.markdown("""
 **Methodology (Independent engine):**
 1. Fetch 1-year daily adjusted closes via Yahoo Finance.
@@ -1227,8 +1435,12 @@ st.markdown("""
 8. Cash-neutrality: search integer lot multiples that minimise |Value1 − Value2|.
 9. Historical stats: count mean-reversion opportunities and win rate over available history.
 10. Lot sizes are hardcoded from latest NSE F&O references (Oct 2026) and can be updated manually when NSE revises them.
+11. Supplementary diagnostics (does not change core signals): Engle–Granger cointegration p-value, spread ADF p-value, log-price hedge ratio, residual-spread half-life and rolling hedge-ratio variation.
+12. Benjamini–Hochberg false-discovery-rate correction is applied across the scanned pair universe (q threshold 0.10).
+13. The supplementary Research Gate is advisory only; it does not alter the original ENTER / WATCH / EXIT action, cash-neutral lot search, ratio calculations, or original historical win-rate method.
+14. The current app still fetches 1-year data to preserve existing behaviour. For robust research, extend the separate research history to 3–5 years and add historical executable prices, transaction costs, contract rolls, walk-forward testing and complete trade-level P&L before treating a pair as validated.
 
-> ⚠️ Educational & research use only. Past mean-reversion does not guarantee future results. Always manage risk and position size carefully.
+> ⚠️ Educational & research use only. Past mean-reversion does not guarantee future performance. The new diagnostics are research screens, not proof of profitability or an 85% win-rate guarantee. Always manage risk and position size carefully.
 """)
 
 # ─────────────────────────────────────────────────────────────
