@@ -25,11 +25,17 @@ Features:
 import streamlit as st
 import pandas as pd
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 import time
 import os
 import warnings
 warnings.filterwarnings("ignore")
+
+# Force IST (UTC+5:30) for all displayed timestamps
+IST = timezone(timedelta(hours=5, minutes=30))
+
+def now_ist():
+    return datetime.now(IST)
 
 try:
     import yfinance as yf
@@ -166,6 +172,27 @@ st.markdown("""
     /* Selectbox / inputs */
     .stSelectbox label, .stSlider label, .stMultiSelect label {
         color: #90CAF9 !important;
+    }
+    /* Make selectbox dropdown options clearly legible */
+    div[data-baseweb="select"] > div {
+        background-color: #1A1F2E !important;
+        color: #FFFFFF !important;
+        border: 1px solid #37474F !important;
+    }
+    div[data-baseweb="select"] span,
+    div[data-baseweb="select"] div {
+        color: #FFFFFF !important;
+    }
+    ul[data-testid="stSelectboxVirtualDropdown"] li,
+    div[role="listbox"] li,
+    div[role="option"] {
+        background-color: #1A1F2E !important;
+        color: #FFFFFF !important;
+    }
+    div[role="option"]:hover,
+    li[aria-selected="true"] {
+        background-color: #263238 !important;
+        color: #00E5FF !important;
     }
     /* Horizontal rules */
     hr {
@@ -689,7 +716,7 @@ with st.sidebar:
     st.markdown("---")
     st.caption("Data: Yahoo Finance (independent engine)")
     st.caption("Lot sizes: NSE F&O (Oct 2026 reference)")
-    st.caption(f"Clock: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} IST")
+    st.caption(f"Clock: {now_ist().strftime('%Y-%m-%d %H:%M:%S')} IST")
 
     if st.button("🔄 Refresh Now"):
         st.cache_data.clear()
@@ -699,7 +726,7 @@ with st.sidebar:
 # ─────────────────────────────────────────────────────────────
 # HEADER
 # ─────────────────────────────────────────────────────────────
-_now = datetime.now()
+_now = now_ist()
 st.markdown('<p class="main-header">📈 Automated Pair Trading Dashboard</p>', unsafe_allow_html=True)
 st.markdown(
     f'<p class="sub-header">Fully Independent Analytics • Dark theme • '
@@ -762,7 +789,7 @@ for r in results:
         except Exception:
             sig_since = str(m["signal_since"])[:16]
     elif "ENTER" in s["action"]:
-        sig_since = datetime.now().strftime("%d-%b %H:%M")
+        sig_since = now_ist().strftime("%d-%b %H:%M")
 
     rows.append({
         "Pair": p["name"],
@@ -1093,23 +1120,32 @@ if show_charts and HAS_PLOTLY and not selected_result["hist"].empty:
     )
     st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
-    # Current values + reference levels shown BELOW chart (mobile-safe)
+    # Compact values under each chart section (small text, mobile-safe)
     st.markdown(
         f"""
-        <div style="background:#1A1F2E;border-radius:8px;padding:10px 14px;margin-top:-8px;font-size:0.88rem;color:#E0E0E0;">
-        <b>Normalized</b>: 
-        <span style="color:#00E5FF;">{pair_info['s1']}: {norm1.iloc[-1]:.1f}</span> &nbsp;|&nbsp;
-        <span style="color:#FF5252;">{pair_info['s2']}: {norm2.iloc[-1]:.1f}</span>
-        &nbsp;&nbsp;•&nbsp;&nbsp;
-        <b>Ratio</b>: <span style="color:#69F0AE;">{m['ratio']:.4f}</span>
-        &nbsp; 60D Avg {m['ratio_mean']:.4f} &nbsp; 30D Avg {m['ratio_avg_30']:.4f}
-        &nbsp; 30D Max <span style="color:#FF8A80;">{m['ratio_max_30']:.4f}</span>
-        &nbsp; 30D Min <span style="color:#80D8FF;">{m['ratio_min_30']:.4f}</span>
-        &nbsp; 60D Max <span style="color:#FF1744;">{m['ratio_max_60']:.4f}</span>
-        &nbsp; 60D Min <span style="color:#00B0FF;">{m['ratio_min_60']:.4f}</span>
-        &nbsp;&nbsp;•&nbsp;&nbsp;
-        <b>Z-Score</b>: <span style="color:#E040FB;">{m['zscore']:.2f}</span>
-        &nbsp; Entry ±{z_entry} &nbsp; Exit ±{z_exit}
+        <div style="background:#1A1F2E;border-radius:8px;padding:8px 12px;margin-top:-6px;font-size:0.78rem;line-height:1.55;color:#B0BEC5;">
+        <div>
+          <span style="color:#90CAF9;font-weight:600;">Normalized</span> &nbsp;
+          <span style="color:#00E5FF;">{pair_info['s1'].replace('.NS','')}: {norm1.iloc[-1]:.1f}</span>
+          &nbsp;|&nbsp;
+          <span style="color:#FF5252;">{pair_info['s2'].replace('.NS','').replace('^','')}: {norm2.iloc[-1]:.1f}</span>
+        </div>
+        <div>
+          <span style="color:#90CAF9;font-weight:600;">Ratio</span> &nbsp;
+          <span style="color:#69F0AE;font-weight:600;">{m['ratio']:.4f}</span>
+          &nbsp;·&nbsp; 60D Avg {m['ratio_mean']:.4f}
+          &nbsp;·&nbsp; 30D Avg {m['ratio_avg_30']:.4f}
+          &nbsp;·&nbsp; 30D Max <span style="color:#FF8A80;">{m['ratio_max_30']:.4f}</span>
+          &nbsp;·&nbsp; 30D Min <span style="color:#80D8FF;">{m['ratio_min_30']:.4f}</span>
+          &nbsp;·&nbsp; 60D Max <span style="color:#FF1744;">{m['ratio_max_60']:.4f}</span>
+          &nbsp;·&nbsp; 60D Min <span style="color:#00B0FF;">{m['ratio_min_60']:.4f}</span>
+        </div>
+        <div>
+          <span style="color:#90CAF9;font-weight:600;">Z-Score</span> &nbsp;
+          <span style="color:#E040FB;font-weight:600;">{m['zscore']:.2f}</span>
+          &nbsp;·&nbsp; Entry ±{z_entry}
+          &nbsp;·&nbsp; Exit ±{z_exit}
+        </div>
         </div>
         """,
         unsafe_allow_html=True,
