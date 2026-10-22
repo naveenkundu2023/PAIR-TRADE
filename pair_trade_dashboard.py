@@ -783,14 +783,20 @@ def enhanced_pair_diagnostics(df: pd.DataFrame, lookback: int = 60) -> dict:
 
 def apply_bh_fdr_correction(results: list, pvalue_key: str = "coint_pvalue",
                             q_threshold: float = 0.10) -> None:
-    """Apply Benjamini-Hochberg FDR correction across available pair p-values."""
+    """Add BH-FDR results separately; never overwrite the underlying diagnostic status.
+
+    The FDR result is a separate research column. It must not mask a more useful
+    status such as TEST ERROR, FAIL STATISTICAL TEST, WATCH HALF-LIFE, or PASS PRELIMINARY.
+    """
     candidates = []
     for item in results:
         diag = item.get("enhanced", {})
         pval = diag.get(pvalue_key, np.nan)
-        if pval is not None and np.isfinite(pval):
-            candidates.append((float(pval), item))
         diag["coint_qvalue"] = np.nan
+        diag["fdr_status"] = "NOT TESTED"
+        diag["fdr_reason"] = "No valid cointegration p-value available"
+        if pval is not None and np.isfinite(pval) and 0.0 <= float(pval) <= 1.0:
+            candidates.append((float(pval), item))
 
     candidates.sort(key=lambda x: x[0])
     n = len(candidates)
@@ -806,15 +812,17 @@ def apply_bh_fdr_correction(results: list, pvalue_key: str = "coint_pvalue",
         adjusted[reverse_index] = min(1.0, running_min)
 
     for (_, item), qval in zip(candidates, adjusted):
-        item["enhanced"]["coint_qvalue"] = float(qval)
         diag = item["enhanced"]
-        if np.isfinite(diag.get("coint_pvalue", np.nan)):
-            if qval >= q_threshold:
-                diag["enhanced_status"] = "FAIL FDR FILTER"
-                diag["enhanced_reason"] = (
-                    f"Cointegration did not pass Benjamini–Hochberg FDR q<{q_threshold:.2f}; "
-                    "this is a research screen, not a final trading decision"
-                )
+        diag["coint_qvalue"] = float(qval)
+        if qval < q_threshold:
+            diag["fdr_status"] = "PASS FDR"
+            diag["fdr_reason"] = f"BH-adjusted q-value is below {q_threshold:.2f}"
+        else:
+            diag["fdr_status"] = "FAIL FDR"
+            diag["fdr_reason"] = (
+                f"BH-adjusted q-value is not below {q_threshold:.2f}; "
+                "this is a separate multiple-testing check, not an overall pair verdict"
+            )
 
 
 def recommend_prices(metrics: dict, signal: dict) -> dict:
@@ -925,7 +933,8 @@ for i, pair in enumerate(pairs_to_scan):
     })
 
 # Apply multiple-testing correction across the scanned universe.
-# This is a supplementary research label only; existing trading signals remain unchanged.
+# BH-FDR is stored in its own column; it does not overwrite other diagnostic statuses
+# and does not alter existing trading signals.
 apply_bh_fdr_correction(results, pvalue_key="coint_pvalue", q_threshold=0.10)
 
 progress.empty()
@@ -978,6 +987,7 @@ for r in results:
         "Spread HL": round(r.get("enhanced", {}).get("spread_half_life", np.nan), 1)
                      if np.isfinite(r.get("enhanced", {}).get("spread_half_life", np.nan)) else "—",
         "Research Gate": r.get("enhanced", {}).get("enhanced_status", "NO DATA"),
+        "BH FDR Gate": r.get("enhanced", {}).get("fdr_status", "NOT TESTED"),
     })
 
 if not rows:
@@ -1410,6 +1420,7 @@ for r in results:
     diagnostic_rows.append({
         "Pair": r["pair"]["name"],
         "Research Gate": ed.get("enhanced_status", "NO DATA"),
+        "BH FDR Gate": ed.get("fdr_status", "NOT TESTED"),
         "Cointegration p": round(ed.get("coint_pvalue"), 4) if np.isfinite(ed.get("coint_pvalue", np.nan)) else "—",
         "Cointegration q": round(ed.get("coint_qvalue"), 4) if np.isfinite(ed.get("coint_qvalue", np.nan)) else "—",
         "Spread ADF p": round(ed.get("spread_adf_pvalue"), 4) if np.isfinite(ed.get("spread_adf_pvalue", np.nan)) else "—",
@@ -1417,6 +1428,7 @@ for r in results:
         "Spread Half-Life": round(ed.get("spread_half_life"), 1) if np.isfinite(ed.get("spread_half_life", np.nan)) else "—",
         "Beta Variation %": round(ed.get("beta_stability_pct"), 1) if np.isfinite(ed.get("beta_stability_pct", np.nan)) else "—",
         "Reason": ed.get("enhanced_reason", ""),
+        "FDR Note": ed.get("fdr_reason", ""),
     })
 if diagnostic_rows:
     st.dataframe(pd.DataFrame(diagnostic_rows), use_container_width=True, hide_index=True)
