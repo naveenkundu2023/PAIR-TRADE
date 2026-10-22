@@ -1,5 +1,5 @@
 """
-Pair Trading Dashboard - Streamlit App (Enhanced v3 - Fully Independent - 22-10-2026-12:30 pm )
+Pair Trading Dashboard - Streamlit App (Enhanced v3 - Fully Independent)
 =======================================================================
 Automated pair-trading signal dashboard using independent analytics only.
 No Excel dependency.
@@ -142,11 +142,11 @@ st.markdown("""
         border-bottom: 1px solid #37474F;
         font-size: 0.9rem;
     }
-    /* Divergence dots */
-    .dot-green { color: #00E676; font-size: 1.3rem; }
-    .dot-red   { color: #FF5252; font-size: 1.3rem; }
-    .dot-gray  { color: #78909C; font-size: 1.3rem; }
-    .dot-white { color: #FFFFFF; font-size: 1.3rem; }
+    /* Divergence dots – use !important so global span rule does not override */
+    .dot-green { color: #00E676 !important; font-size: 1.4rem !important; }
+    .dot-red   { color: #FF5252 !important; font-size: 1.4rem !important; }
+    .dot-gray  { color: #78909C !important; font-size: 1.4rem !important; }
+    .dot-white { color: #ECEFF1 !important; font-size: 1.4rem !important; }
     /* Sidebar */
     [data-testid="stSidebar"] {
         background-color: #12161F;
@@ -689,7 +689,7 @@ with st.sidebar:
     st.markdown("---")
     st.caption("Data: Yahoo Finance (independent engine)")
     st.caption("Lot sizes: NSE F&O (Oct 2026 reference)")
-    st.caption(f"Clock: {datetime.now().strftime('%H:%M:%S')} IST")
+    st.caption(f"Clock: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} IST")
 
     if st.button("🔄 Refresh Now"):
         st.cache_data.clear()
@@ -699,10 +699,11 @@ with st.sidebar:
 # ─────────────────────────────────────────────────────────────
 # HEADER
 # ─────────────────────────────────────────────────────────────
+_now = datetime.now()
 st.markdown('<p class="main-header">📈 Automated Pair Trading Dashboard</p>', unsafe_allow_html=True)
 st.markdown(
     f'<p class="sub-header">Fully Independent Analytics • Dark theme • '
-    f'Updated {datetime.now().strftime("%Y-%m-%d %H:%M:%S")} IST</p>',
+    f'Updated {_now.strftime("%Y-%m-%d %H:%M:%S")} IST</p>',
     unsafe_allow_html=True,
 )
 st.caption("📂 Independent engine only — no Excel dependency. Lot sizes from latest NSE F&O references (Oct 2026).")
@@ -1007,20 +1008,21 @@ if m.get("last5_div") and m.get("last5_dates"):
     dots_html = []
     for d, div in zip(m["last5_dates"], m["last5_div"]):
         if np.isnan(div):
-            cls, label = "dot-gray", "●"
+            color, label = "#78909C", "●"
             val_str = "—"
-        elif div > 0.005:
-            cls, label = "dot-green", "●"
-            val_str = f"+{div:.3f}"
-        elif div < -0.005:
-            cls, label = "dot-red", "●"
-            val_str = f"{div:.3f}"
+        elif div > 0.001:   # lower threshold so green/red appear more often
+            color, label = "#00E676", "●"
+            val_str = f"+{div:.4f}"
+        elif div < -0.001:
+            color, label = "#FF5252", "●"
+            val_str = f"{div:.4f}"
         else:
-            cls, label = "dot-white", "●"
-            val_str = f"{div:.3f}"
+            color, label = "#ECEFF1", "●"
+            val_str = f"{div:.4f}"
+        # inline color so global CSS cannot override
         dots_html.append(
-            f'<div style="display:inline-block;text-align:center;margin:0 10px;">'
-            f'<span class="{cls}" title="{d}: {div:.4f}">{label}</span><br>'
+            f'<div style="display:inline-block;text-align:center;margin:0 12px;">'
+            f'<span style="color:{color} !important;font-size:1.5rem;">{label}</span><br>'
             f'<small style="color:#90A4AE;">{d}</small><br>'
             f'<small style="color:#B0BEC5;">{val_str}</small></div>'
         )
@@ -1028,9 +1030,9 @@ if m.get("last5_div") and m.get("last5_dates"):
 
     divs = [x for x in m["last5_div"] if not np.isnan(x)]
     if len(divs) >= 2:
-        if divs[-1] > divs[0] + 0.005:
+        if divs[-1] > divs[0] + 0.001:
             st.caption("Divergence is **rising** (ratio moving away from its 20-SMA) → stretch building.")
-        elif divs[-1] < divs[0] - 0.005:
+        elif divs[-1] < divs[0] - 0.001:
             st.caption("Divergence is **falling** (ratio moving back toward its 20-SMA) → mean-reversion in progress.")
         else:
             st.caption("Divergence is roughly **stable** over the last 5 sessions.")
@@ -1038,7 +1040,7 @@ if m.get("last5_div") and m.get("last5_dates"):
 else:
     st.caption("Not enough history for 5-day divergence dots.")
 
-# ── Charts (enhanced with value annotations) ──
+# ── Charts (clean original layout – values shown below chart, no paper annotations) ──
 if show_charts and HAS_PLOTLY and not selected_result["hist"].empty:
     hist = selected_result["hist"]
     ratio_s = m["ratio_series"]
@@ -1047,75 +1049,71 @@ if show_charts and HAS_PLOTLY and not selected_result["hist"].empty:
     fig = make_subplots(
         rows=3, cols=1,
         shared_xaxes=True,
-        vertical_spacing=0.08,
+        vertical_spacing=0.07,
         subplot_titles=(
             f"Normalized Prices — {pair_info['s1']} vs {pair_info['s2']}",
             "Ratio (Price1 / Price2) + Reference Levels",
             "Z-Score of Ratio",
         ),
-        row_heights=[0.34, 0.34, 0.32],
+        row_heights=[0.35, 0.35, 0.30],
     )
 
     norm1 = hist["price1"] / hist["price1"].iloc[0] * 100
     norm2 = hist["price2"] / hist["price2"].iloc[0] * 100
-    fig.add_trace(go.Scatter(x=hist.index, y=norm1, name=f"{pair_info['s1']} ({norm1.iloc[-1]:.1f})",
+    fig.add_trace(go.Scatter(x=hist.index, y=norm1, name=pair_info["s1"],
                              line=dict(color="#00E5FF", width=1.5)), row=1, col=1)
-    fig.add_trace(go.Scatter(x=hist.index, y=norm2, name=f"{pair_info['s2']} ({norm2.iloc[-1]:.1f})",
+    fig.add_trace(go.Scatter(x=hist.index, y=norm2, name=pair_info["s2"],
                              line=dict(color="#FF5252", width=1.5)), row=1, col=1)
 
-    # Ratio + levels
-    fig.add_trace(go.Scatter(x=ratio_s.index, y=ratio_s, name=f"Ratio ({m['ratio']:.4f})",
+    # Ratio + levels (simple hlines, labels outside via caption below)
+    fig.add_trace(go.Scatter(x=ratio_s.index, y=ratio_s, name="Ratio",
                              line=dict(color="#69F0AE", width=1.8)), row=2, col=1)
-    fig.add_hline(y=m["ratio_mean"], line_dash="dash", line_color="#FFEA00",
-                  annotation_text=f"60D Avg {m['ratio_mean']:.4f}", annotation_position="bottom right", row=2, col=1)
-    fig.add_hline(y=m["ratio_avg_30"], line_dash="dot", line_color="#FFD54F",
-                  annotation_text=f"30D Avg {m['ratio_avg_30']:.4f}", annotation_position="top right", row=2, col=1)
-    fig.add_hline(y=m["ratio_max_30"], line_dash="dot", line_color="#FF8A80",
-                  annotation_text=f"30D Max {m['ratio_max_30']:.4f}", row=2, col=1)
-    fig.add_hline(y=m["ratio_min_30"], line_dash="dot", line_color="#80D8FF",
-                  annotation_text=f"30D Min {m['ratio_min_30']:.4f}", row=2, col=1)
-    fig.add_hline(y=m["ratio_max_60"], line_dash="dot", line_color="#FF1744",
-                  annotation_text=f"60D Max {m['ratio_max_60']:.4f}", row=2, col=1)
-    fig.add_hline(y=m["ratio_min_60"], line_dash="dot", line_color="#00B0FF",
-                  annotation_text=f"60D Min {m['ratio_min_60']:.4f}", row=2, col=1)
+    fig.add_hline(y=m["ratio_mean"], line_dash="dash", line_color="#FFEA00", row=2, col=1)
+    fig.add_hline(y=m["ratio_max_30"], line_dash="dot", line_color="#FF8A80", row=2, col=1)
+    fig.add_hline(y=m["ratio_min_30"], line_dash="dot", line_color="#80D8FF", row=2, col=1)
+    fig.add_hline(y=m["ratio_max_60"], line_dash="dot", line_color="#FF1744", row=2, col=1)
+    fig.add_hline(y=m["ratio_min_60"], line_dash="dot", line_color="#00B0FF", row=2, col=1)
 
     # Z-score
-    fig.add_trace(go.Scatter(x=z_s.index, y=z_s, name=f"Z-Score ({m['zscore']:.2f})",
+    fig.add_trace(go.Scatter(x=z_s.index, y=z_s, name="Z-Score",
                              line=dict(color="#E040FB", width=1.8)), row=3, col=1)
-    fig.add_hline(y=z_entry, line_dash="dash", line_color="#FF5252",
-                  annotation_text=f"+{z_entry}", annotation_position="bottom right", row=3, col=1)
-    fig.add_hline(y=-z_entry, line_dash="dash", line_color="#00E676",
-                  annotation_text=f"-{z_entry}", annotation_position="top right", row=3, col=1)
+    fig.add_hline(y=z_entry, line_dash="dash", line_color="#FF5252", row=3, col=1)
+    fig.add_hline(y=-z_entry, line_dash="dash", line_color="#00E676", row=3, col=1)
     fig.add_hline(y=0, line_color="#78909C", row=3, col=1)
-    fig.add_hline(y=z_exit, line_dash="dot", line_color="#90A4AE",
-                  annotation_text=f"exit +{z_exit}", row=3, col=1)
-    fig.add_hline(y=-z_exit, line_dash="dot", line_color="#90A4AE",
-                  annotation_text=f"exit -{z_exit}", row=3, col=1)
 
     fig.update_layout(
-        height=820,
+        height=780,
         template="plotly_dark",
         paper_bgcolor="#0E1117",
         plot_bgcolor="#1A1F2E",
         showlegend=True,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, font=dict(color="#E0E0E0")),
         font=dict(color="#E0E0E0"),
+        margin=dict(l=40, r=20, t=60, b=40),
     )
-    # Add current value annotations at the right edge
-    fig.add_annotation(x=1.0, y=norm1.iloc[-1], xref="paper", yref="y",
-                       text=f"{norm1.iloc[-1]:.1f}", showarrow=False,
-                       font=dict(color="#00E5FF", size=11), xanchor="left", row=1, col=1)
-    fig.add_annotation(x=1.0, y=norm2.iloc[-1], xref="paper", yref="y",
-                       text=f"{norm2.iloc[-1]:.1f}", showarrow=False,
-                       font=dict(color="#FF5252", size=11), xanchor="left", row=1, col=1)
-    fig.add_annotation(x=1.0, y=m["ratio"], xref="paper", yref="y2",
-                       text=f"{m['ratio']:.4f}", showarrow=False,
-                       font=dict(color="#69F0AE", size=11), xanchor="left", row=2, col=1)
-    fig.add_annotation(x=1.0, y=m["zscore"], xref="paper", yref="y3",
-                       text=f"{m['zscore']:.2f}", showarrow=False,
-                       font=dict(color="#E040FB", size=11), xanchor="left", row=3, col=1)
+    st.plotly_chart(fig, use_container_width=True, config={"displayModeBar": False})
 
-    st.plotly_chart(fig, use_container_width=True)
+    # Current values + reference levels shown BELOW chart (mobile-safe)
+    st.markdown(
+        f"""
+        <div style="background:#1A1F2E;border-radius:8px;padding:10px 14px;margin-top:-8px;font-size:0.88rem;color:#E0E0E0;">
+        <b>Normalized</b>: 
+        <span style="color:#00E5FF;">{pair_info['s1']}: {norm1.iloc[-1]:.1f}</span> &nbsp;|&nbsp;
+        <span style="color:#FF5252;">{pair_info['s2']}: {norm2.iloc[-1]:.1f}</span>
+        &nbsp;&nbsp;•&nbsp;&nbsp;
+        <b>Ratio</b>: <span style="color:#69F0AE;">{m['ratio']:.4f}</span>
+        &nbsp; 60D Avg {m['ratio_mean']:.4f} &nbsp; 30D Avg {m['ratio_avg_30']:.4f}
+        &nbsp; 30D Max <span style="color:#FF8A80;">{m['ratio_max_30']:.4f}</span>
+        &nbsp; 30D Min <span style="color:#80D8FF;">{m['ratio_min_30']:.4f}</span>
+        &nbsp; 60D Max <span style="color:#FF1744;">{m['ratio_max_60']:.4f}</span>
+        &nbsp; 60D Min <span style="color:#00B0FF;">{m['ratio_min_60']:.4f}</span>
+        &nbsp;&nbsp;•&nbsp;&nbsp;
+        <b>Z-Score</b>: <span style="color:#E040FB;">{m['zscore']:.2f}</span>
+        &nbsp; Entry ±{z_entry} &nbsp; Exit ±{z_exit}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     # Z-score interpretation
     st.markdown("##### 📖 Z-Score Trend Interpretation")
