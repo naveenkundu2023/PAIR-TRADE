@@ -1,5 +1,5 @@
 """
-Pair Trading Dashboard - Streamlit App (Enhanced v3.3 - Correlation + Speed) - FIXED
+Pair Trading Dashboard - Streamlit App (Enhanced v3.4 - Correlation + Speed + Compact Board)
 =======================================================================
 Automated pair-trading signal dashboard using independent analytics only.
 No Excel dependency.
@@ -21,7 +21,7 @@ Features:
     - Historical win-rate simulation (12 months) sorted by win rate
     - Row coloring: light green (ENTER), light yellow (WATCH), light pink (EXIT/HOLD)
     - Signal timestamp (approximate entry time of current signal)
-    - Signal board: 1-based index, sorted ENTER (freshest first) → EXIT/HOLD → WATCH
+    - Signal board: 1-based index only (no extra 0/1/2 column), compact font
     - Charts: 4 panels (Normalized Prices, Ratio, Z-Score, Rolling Correlation)
     - Independent analytics ranked by confidence (gradient green)
     - Speed: one yf.download for all tickers + 5-min cache
@@ -71,7 +71,7 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# Dark theme CSS – light text, colourful accents
+# Dark theme CSS – light text, colourful accents + compact dataframe
 st.markdown("""
 <style>
     /* Global dark */
@@ -165,9 +165,24 @@ st.markdown("""
     [data-testid="stSidebar"] * {
         color: #E0E0E0 !important;
     }
-    /* Dataframe */
+    /* Dataframe – compact font so more pairs & columns fit */
     .stDataFrame {
         background: #1A1F2E;
+    }
+    .stDataFrame [data-testid="stDataFrameResizable"] {
+        font-size: 0.72rem !important;
+    }
+    .stDataFrame table {
+        font-size: 0.72rem !important;
+    }
+    .stDataFrame th {
+        font-size: 0.70rem !important;
+        padding: 4px 6px !important;
+    }
+    .stDataFrame td {
+        font-size: 0.72rem !important;
+        padding: 3px 6px !important;
+        white-space: nowrap;
     }
     /* Info / warning boxes */
     .stAlert {
@@ -891,7 +906,7 @@ for i, pair in enumerate(pairs_to_scan):
 progress.empty()
 
 # ─────────────────────────────────────────────────────────────
-# SUMMARY TABLE
+# SUMMARY TABLE — compact, no extra index column
 # ─────────────────────────────────────────────────────────────
 st.subheader("🎯 Live Signal Board — All Pairs")
 
@@ -953,6 +968,7 @@ df_signals = df_signals.sort_values(
     na_position="last",
 ).reset_index(drop=True)
 
+# 1-based index only
 df_signals.insert(0, "#", range(1, len(df_signals) + 1))
 
 display_cols = [c for c in df_signals.columns if not c.startswith("_")]
@@ -987,7 +1003,8 @@ styled = (df_display.style
               "Ratio": "{:.4f}", "Z-Score": "{:.2f}",
           }))
 
-st.dataframe(styled, use_container_width=True, height=920)
+# hide_index=True removes the unwanted 0,1,2... column
+st.dataframe(styled, use_container_width=True, height=920, hide_index=True)
 
 enter_count = sum(1 for r in rows if "ENTER" in r["Action"])
 watch_count = sum(1 for r in rows if "WATCH" in r["Action"])
@@ -1295,7 +1312,7 @@ if show_charts and HAS_PLOTLY and not selected_result["hist"].empty:
         },
     )
 
-    # ---- FIXED f-string section (the previous crash) ----
+    # ---- FIXED f-string section ----
     c30 = m["corr_30"]
     c60 = m["corr_60"]
     c90 = m["corr_90"]
