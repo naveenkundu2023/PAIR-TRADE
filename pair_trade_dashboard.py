@@ -1,5 +1,5 @@
 """
-Pair Trading Dashboard - Streamlit App (Enhanced v3.3 - Correlation + Speed)
+Pair Trading Dashboard - Streamlit App (Enhanced v3.3 - Correlation + Speed) - FIXED
 =======================================================================
 Automated pair-trading signal dashboard using independent analytics only.
 No Excel dependency.
@@ -1295,12 +1295,17 @@ if show_charts and HAS_PLOTLY and not selected_result["hist"].empty:
         },
     )
 
+    # ---- FIXED f-string section (the previous crash) ----
     c30 = m["corr_30"]
     c60 = m["corr_60"]
     c90 = m["corr_90"]
     corr_ok = (not np.isnan(c30) and abs(c30) >= 0.80) and (not np.isnan(c60) and abs(c60) >= 0.80)
     corr_color = "#00E676" if corr_ok else "#FF8A80"
     corr_label = "PASS (≥0.80 both)" if corr_ok else "FAIL (need both ≥0.80)"
+
+    c30_str = f"{c30:.2f}" if not np.isnan(c30) else "—"
+    c60_str = f"{c60:.2f}" if not np.isnan(c60) else "—"
+    c90_str = f"{c90:.2f}" if not np.isnan(c90) else "—"
 
     st.markdown(
         f"""
@@ -1335,9 +1340,9 @@ if show_charts and HAS_PLOTLY and not selected_result["hist"].empty:
         <div>
           <span style="color:#90CAF9;font-weight:600;">Correlation</span> &nbsp;
           <span style="color:{corr_color};font-weight:600;">
-            30D: {c30:.2f if not np.isnan(c30) else '—'} &nbsp;·&nbsp;
-            60D: {c60:.2f if not np.isnan(c60) else '—'} &nbsp;·&nbsp;
-            90D: {c90:.2f if not np.isnan(c90) else '—'}
+            30D: {c30_str} &nbsp;·&nbsp;
+            60D: {c60_str} &nbsp;·&nbsp;
+            90D: {c90_str}
           </span>
           &nbsp;→&nbsp; <span style="color:{corr_color};font-weight:700;">{corr_label}</span>
         </div>
